@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>.osu to .txt Converter</title>
+</head>
+<body>
+<h1>.osu to .txt Converter</h1>
+<p>Upload one or more .osu files. Outputs one line per map.</p>
+<input type="file" id="file" accept=".osu" multiple>
+<br><br>
+<select id="dec">
+<option value="2">Beats with 2 decimals</option>
+<option value="0">Whole beats</option>
+</select>
+<button id="convert" disabled>Convert</button>
+<button id="download" disabled>Download level_data.txt</button>
+<button id="copy" disabled>Copy</button>
+<p id="err" style="color:red"></p>
+<p id="stats"></p>
+<textarea id="out" readonly rows="12" cols="80"></textarea>
+<p>Each line is one map. Beat decimals use "_" (2_5 = 2.5). Spinner: 3.BPM.start.end.</p>
+<script>
+const $ = id => document.getElementById(id);
+let files = [], result = '';
+
+const DEFAULT_COLORS = [[255,192,0],[0,202,0],[18,124,255],[242,24,57]];
+
+function rgbToHue255(r, g, b) {
+  r /= 255; g /= 255; b /= 255;
+  const max = Math.max(r, g, b), min = Math.min(r, g, b), d = max - min;
+  if (d === 0) return 0;
+  let h;
+  if (max === r) h = ((g - b) / d) % 6;
+  else if (max === g) h = (b - r) / d + 2;
+  else h = (r - g) / d + 4;
+  h *= 60; if (h < 0) h += 360;
+  return Math.round(h * 255 / 360) % 256;
+}
+
+const mapX = v => Math.round(v / 512 * 300 - 150);   // 0..512 -> -150..150
+const mapY = v => Math.round(100 - v / 384 * 200);   // 0..384 -> 100..-100 (osu Y goes down, Scratch Y goes up)
+
+function hitsoundOf(v) {           // 0 normal, 1 finish, 2 clap, 3 whistle
+  if (v & 4) return 1;
+  if (v & 8) return 2;
+  if (v & 2) return 3;
+  return 0;
+}
+
+function parseSections(src) {
+  const sec = {}; let cur = null;
+  for (let line of src.split(/\r?\n/)) {
+    line = line.trim();
+    if (!line || line.startsWith('//')) continue;
+    const m = line.match(/^\[(.+)\]$/);
+    if (m) { cur = m[1]; sec[cur] = []; continue; }
+    if (cur) sec[cur].push(line);
+  }
+  return sec;
+}
+
+function convert(src) {
+  const sec = parseSections(src);
+  if (!sec.HitObjects || !sec.TimingPoints) throw new Error('Could not find [TimingPoints] or [HitObjects]. Is this a valid .osu file?');
+
+  // Slider multiplier
+  let sm = 1.4;
+  for (const l of sec.Difficulty || []) {
+    const [k, v] = l.split(':'); if (k.trim() === 'SliderMultiplier') sm = parseFloat(v);
+  }
+
+  // Timing points
+  const tps = sec.TimingPoints.map(l => {
+    const p = l.split(',').map(Number);
+    return { t: p[0], bl: p[1], unin: p.length > 6 ? p[6] === 1 : p[1] > 0 };
+  }).sort((a, b) => a.t - b.t);
+  const reds = tps.filter(p => p.unin && p.bl > 0);
+  if (!reds.length) throw new Error('No uninherited timing points (BPM) found.');
+  const first = reds[0];
+  const bpm = Math.round(60000 / first.bl);
+  const offset = first.t;
+  const dec = +$('dec').value;
+  const toBeat = ms => { const b = (ms - offset) / first.bl; return dec ? (Math.round(b * 10 ** dec) / 10 ** dec).toString().replace('.', '_') : Math.round(b).toString(); };
+  const md = {};
+  for (const l of sec.Metadata || []) { const i = l.indexOf(':'); md[l.slice(0, i)] = l.slice(i + 1).trim(); }
+
+  // Colors
+  const colors = [];
+  for (const l of sec.Colours || []) {
+    const m = l.match(/^Combo(\d+)\s*:\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/i);
+    if (m) colors[+m[1] - 1] = [+m[2], +m[3], +m[4]];
+  }
+  const palette = colors.filter(Boolean).length ? colors.filter(Boolean) : DEFAULT_COLORS;
+
+  // Timing lookup at time t
+  function timingAt(t) {
+    let bl = reds[0].bl, sv = 1;
+    for (const p of tps) {
+      if (p.t > t) break;
+      if (p.unin && p.bl > 0) { bl = p.bl; sv = 1; }
+      else if (p.bl < 0) sv = Math.min(10, Math.max(0.1, -100 / p.bl));
+    }
+    return { bl, sv };
+  }
+
+  const out = []; const counts = { c: 0, s: 0, sp: 0 };
+  let ci = -1, firstObj = true;
+
+  for (const l of sec.HitObjects) {
+    const p = l.split(',');
+    if (p.length < 5) continue;
+    const x = mapX(+p[0]), y = mapY(+p[1]), t = +p[2], type = +p[3], hs = +p[4];
+
+    if (type & 8) {                                  // Spinner
+      out.push(`3.${bpm}.${toBeat(t)}.${toBeat(+p[5])}`);
+      counts.sp++; ci = ci + 1 + ((type >> 4) & 7); firstObj = false;
+      continue;
+    }
+    if (type & 4 || firstObj) ci = (firstObj && !(type & 4) ? 0 : ci + 1 + ((type >> 4) & 7));
+    firstObj = false;
+    const rgb = palette[((ci % palette.length) + palette.length) % palette.length];
+    const hue = rgbToHue255(...rgb);
+    const hsv = hitsoundOf(hs);
+
+    if (type & 2) {                                  // Slider
+      const pts = (p[5] || '').split('|').slice(1).map(s => s.split(':').map(Number));
+      const slides = parseInt(p[6]) || 1, len = parseFloat(p[7]) || 0;
+      const { bl, sv } = timingAt(t);
+      const endMs = t + (len / (sm * 100 * sv)) * bl * slides;
+      let ex = x, ey = y;
+      if (slides % 2 === 1 && pts.length) { ex = mapX(pts[pts.length - 1][0]); ey = mapY(pts[pts.length - 1][1]); }
+      out.push(`1.${bpm}.${hsv}.${x}.${y}.${ex}.${ey}.${hue}.${toBeat(t)}.${toBeat(endMs)}`);
+      counts.s++;
+    } else if (type & 1) {                           // Circle
+      out.push(`0.${bpm}.${hsv}.${x}.${y}.${hue}.${toBeat(t)}`);
+      counts.c++;
+    }
+  }
+  return { line: out.join(','), bpm, counts, name: `${md.Title || 'Mapa'} [${md.Version || ''}]` };
+}
+
+function setErr(m) { $('err').textContent = m || '';  }
+
+function save(content, name) {
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([content], { type: 'text/plain' }));
+  a.download = name; a.click(); URL.revokeObjectURL(a.href);
+}
+
+function setFiles(list) {
+  const fs = [...list].filter(f => /\.osu$/i.test(f.name));
+  if (!fs.length) { setErr('Files must be .osu'); return; }
+  setErr('');
+  Promise.all(fs.map(f => f.text().then(t => ({ name: f.name, text: t })))).then(r => {
+    files = r;
+    $('convert').disabled = false;
+  });
+}
+
+$('file').onchange = e => setFiles(e.target.files);
+
+$('convert').onclick = () => {
+  try {
+    setErr('');
+    const rs = files.map(f => { try { return convert(f.text); } catch (e) { throw new Error(f.name + ': ' + e.message); } });
+    result = rs.map(r => r.line).join('\n');
+    $('out').value = result;
+    const sum = k => rs.reduce((a, r) => a + r.counts[k], 0);
+    $('stats').textContent = `Maps: ${rs.length} | Circles: ${sum('c')} | Sliders: ${sum('s')} | Spinners: ${sum('sp')} | Characters: ${result.length}`;
+    $('download').disabled = $('copy').disabled = !result;
+  } catch (e) { setErr(e.message); }
+};
+$('download').onclick = () => save(result, 'level_data.txt');
+
+$('copy').onclick = async () => {
+  try { await navigator.clipboard.writeText(result); $('copy').textContent = 'Copied!'; }
+  catch { $('out').select(); document.execCommand('copy'); }
+  setTimeout(() => $('copy').textContent = 'Copy', 1200);
+};
+</script>
+</body>
+</html>
